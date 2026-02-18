@@ -89,7 +89,7 @@ flowchart TD
   "product_name": "Full product name including variant if visible, else ''",
   "product_name_confidence": 0.0,
   "category": "English category (항상 영문)",
-  "brand": "Brand name or ''",
+  "brand": "최상위 제조사/브랜드명만 (서브브랜드·라인명 제외)",
   "brand_confidence": 0.0,
   "image_features": "시각적 특징 요약 — 단일 문자열 (객체/배열 불가)",
   "key_features": ["고유 텍스트/디자인 사실 (중복 제거, 8~20개)"],
@@ -99,6 +99,13 @@ flowchart TD
 
 > 비상품 이미지인 경우: `{"error": "Unable to identify product image", "description": "reason"}`
 
+**할루시네이션 방지 규칙:**
+- **텍스트 판독**: 패키지 텍스트를 글자 그대로 정확히 보고. 애매한 문자는 추측하지 않고 confidence를 ≤ 0.6으로 설정
+- **한글 유사 문자 주의**: 요↔려, 삼↔산, 물↔뭘 등 오독 빈발 글자는 불확실하면 낮은 confidence 선택
+- **`brand` 필드**: 최상위 제조사/회사명만 기재 (예: "롯데", "CJ제일제당", "오뚜기"). 서브브랜드/라인명은 `product_name` 또는 `key_features`로 이동
+  - ✗ "롯데 오늘 온차" → ✓ brand="롯데", product_name에 "오늘 온차" 포함
+- **confidence 보수적 운영**: 의심 시 항상 낮은 tier 선택. 1.0은 모든 글자가 100% 명확한 경우에만 사용
+
 **`key_features` dedup 규칙:**
 - 중복/유사 항목 통합, 개당 하나의 개념만 포함
 - 최소 8개 ~ 최대 20개
@@ -107,9 +114,9 @@ flowchart TD
 **신뢰도(confidence) 기준:**
 | 값 | 의미 |
 |----|------|
-| 1.0 | 텍스트/로고가 이미지에서 명확히 판독됨 |
-| 0.7–0.9 | 일부 가려지거나 흐릿하지만 높은 확신 |
-| 0.4–0.6 | 포장 스타일/색상 등 시각적 맥락으로 추론 |
+| 1.0 | 모든 글자가 100% 명확하고 모호함 없음 (엄격 적용) |
+| 0.7–0.9 | 대부분 판독 가능하나 1~2자 약간 불명확 |
+| 0.4–0.6 | 상당 부분이 시각 맥락 추론. 불확실 시 이 구간 사용 |
 | 0.1–0.3 | 일반적 외형 기반 낮은 확신 |
 | 0.0 | 식별 불가 |
 
@@ -128,8 +135,11 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    START(["image_analysis 읽기"]) --> CHECK{"product_name_confidence > 0.7\nAND brand_confidence > 0.7?"}
-    CHECK -->|YES| SRC_IMAGE["source = image\nrag_confidence 미포함"]
+    START(["image_analysis 읽기"]) --> HALLU{"할루시네이션 체크\n(브랜드 과잉확장, 유사문자 오독,\nconfidence 과대, 존재하지 않는 제품명)"}
+    HALLU -->|"의심 징후 있음"| SDB
+    HALLU -->|"의심 징후 없음"| CHECK{"product_name_confidence > 0.7\nAND brand_confidence > 0.7?"}
+    CHECK -->|YES| BRAND_CLEAN["brand 정리\n(서브브랜드 제거)"]
+    BRAND_CLEAN --> SRC_IMAGE["source = image\nrag_confidence 미포함"]
     CHECK -->|NO| SDB["search_local_db(key_features)"]
     SDB --> FOUND{"최고 score >= 0.5\nAND 이미지 근거 일치?"}
     FOUND -->|YES| SRC_LOCAL["source = local_db\nrag_confidence.probability = score\nmethod = local_db_score"]
@@ -137,6 +147,14 @@ flowchart TD
     GSEARCH --> SAVE["save_to_local_db()"]
     SAVE --> SRC_GOOGLE["source = google_search\nrag_confidence.probability = 추정값\nmethod = google_search_estimate"]
 ```
+
+**할루시네이션 감지 기준 (rag_agent Step 1):**
+| 패턴 | 설명 | 조치 |
+|------|------|------|
+| 브랜드 과잉 확장 | `brand`에 서브브랜드/라인명 포함 (예: "롯데 오늘 온차") | 분리 후 RAG 강제 |
+| 한글 유사 문자 오독 | 요↔려, 삼↔산 등 OCR 오류 패턴 | RAG 강제 |
+| confidence 과대 | 높은 confidence인데 key_features에 판독 텍스트 적음 | RAG 강제 |
+| 존재하지 않는 제품명 | 감지된 브랜드/카테고리에 해당 제품명 패턴 없음 | RAG 강제 |
 
 **`source` 값별 출력 규칙:**
 

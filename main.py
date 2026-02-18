@@ -66,6 +66,7 @@ async def analyze_image(image_path: str, country: str = "KR", lang: str = "ko") 
     )
 
     result_parts = []
+    all_text_parts = []
     current_agent = None
     token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     async for event in runner.run_async(
@@ -83,6 +84,7 @@ async def analyze_image(image_path: str, country: str = "KR", lang: str = "ko") 
                     continue
                 if part.text:
                     result_parts.append(part.text)
+                    all_text_parts.append(part.text)
         # 토큰 사용량 누적
         um = getattr(event, "usage_metadata", None)
         if um:
@@ -90,7 +92,15 @@ async def analyze_image(image_path: str, country: str = "KR", lang: str = "ko") 
             token_usage["output_tokens"] += um.candidates_token_count or 0
             token_usage["total_tokens"] += um.total_token_count or 0
 
-    return "\n".join(result_parts), token_usage
+    final_text = "\n".join(result_parts).strip()
+    if final_text:
+        return final_text, token_usage
+
+    fallback_text = "\n".join(all_text_parts).strip()
+    if fallback_text:
+        return fallback_text, token_usage
+
+    raise ValueError("모델이 텍스트 응답을 반환하지 않았습니다.")
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
@@ -105,6 +115,60 @@ def strip_code_block(text: str) -> str:
 MAX_RETRIES = 2
 RETRY_DELAY = 3  # seconds
 
+ALLOWED_SOURCES = {"image", "local_db", "google_search"}
+REQUIRED_RESULT_KEYS = {
+    "product_name",
+    "product_name_confidence",
+    "category",
+    "brand",
+    "brand_confidence",
+    "image_features",
+    "key_features",
+    "expiration_date",
+    "source",
+}
+
+
+def validate_result_payload(payload: dict) -> None:
+    """모델 결과 JSON 최소 스키마를 검증합니다."""
+    if not isinstance(payload, dict):
+        raise ValueError("모델 응답 JSON이 객체 형식이 아닙니다.")
+
+    if "error" in payload:
+        return
+
+    missing = [key for key in REQUIRED_RESULT_KEYS if key not in payload]
+    if missing:
+        raise ValueError(f"필수 필드 누락: {', '.join(missing)}")
+
+    source = payload.get("source")
+    if source not in ALLOWED_SOURCES:
+        raise ValueError(f"유효하지 않은 source 값: {source}")
+
+    key_features = payload.get("key_features")
+    if not isinstance(key_features, list) or len(key_features) == 0:
+        raise ValueError("key_features는 비어있지 않은 배열이어야 합니다.")
+
+    if not all(isinstance(item, str) for item in key_features):
+        raise ValueError("key_features의 모든 항목은 문자열이어야 합니다.")
+
+    for field in ("product_name", "category", "brand", "image_features"):
+        if not isinstance(payload.get(field), str):
+            raise ValueError(f"{field} 필드는 문자열이어야 합니다.")
+
+    for confidence_field in ("product_name_confidence", "brand_confidence"):
+        value = payload.get(confidence_field)
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"{confidence_field} 필드는 숫자여야 합니다.")
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"{confidence_field} 값은 0.0~1.0 범위여야 합니다.")
+
+    expiration_date = payload.get("expiration_date")
+    if expiration_date is None:
+        payload["expiration_date"] = ""
+    elif not isinstance(expiration_date, str):
+        raise ValueError("expiration_date 필드는 문자열 또는 빈 문자열이어야 합니다.")
+
 
 async def analyze_single(image_path: str, country: str = "KR", lang: str = "ko"):
     """단일 이미지를 분석하고 결과를 반환합니다. 실패 시 최대 2회 재시도합니다."""
@@ -113,15 +177,23 @@ async def analyze_single(image_path: str, country: str = "KR", lang: str = "ko")
     for attempt in range(1, MAX_RETRIES + 2):  # 1 + 2 retries = 3 attempts
         try:
             result, token_usage = await analyze_image(image_path, country, lang)
+            if not result.strip():
+                raise ValueError("모델 응답이 비어 있습니다.")
+
             elapsed = round(time.time() - start, 2)
             cleaned = strip_code_block(result)
+            if not cleaned:
+                raise ValueError("응답 정제 후 비어 있습니다.")
+
             try:
                 parsed = json.loads(cleaned)
-                parsed["inference_time"] = f"{elapsed}s"
-                parsed["token_usage"] = token_usage
-                return parsed
-            except json.JSONDecodeError:
-                return {"raw": result, "inference_time": f"{elapsed}s", "token_usage": token_usage}
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSON 파싱 실패: {e}") from e
+
+            validate_result_payload(parsed)
+            parsed["inference_time"] = f"{elapsed}s"
+            parsed["token_usage"] = token_usage
+            return parsed
         except Exception as e:
             last_error = e
             if attempt <= MAX_RETRIES:

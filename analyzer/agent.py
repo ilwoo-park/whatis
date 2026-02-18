@@ -30,6 +30,35 @@ What to extract:
 2) Visual evidence (dominant colors, package type/material, graphics/mascots, layout)
 3) Best determination of product_name and brand using text first, visual clues second
 
+## CRITICAL: Anti-Hallucination Rules
+
+### Text Reading
+- Report text EXACTLY as it appears on the package — character by character.
+- If a character is unclear, ambiguous, or partially obscured, mark confidence ≤ 0.6. Do NOT guess the most likely word.
+- Korean characters that look similar (e.g. 요/려, 삼/산, 물/뭘) are common misread sources. If uncertain between two readings, choose the LOWER confidence.
+- Do NOT autocorrect or "fix" what you read. Output raw OCR-level text faithfully.
+
+### Brand Name
+- `brand` must be ONLY the top-level manufacturer/company brand name (e.g. "롯데", "CJ", "오뚜기", "빙그레").
+- Do NOT include sub-brand, product line, or series name in the `brand` field.
+  - WRONG: "롯데 오늘 온차" → CORRECT: brand="롯데", include "오늘 온차" in product_name or key_features instead.
+  - WRONG: "CJ 행복한콩" → CORRECT: brand="CJ제일제당", include "행복한콩" in product_name.
+- If brand text is not explicitly visible as manufacturer/company on the package, do NOT infer aggressively from product line names.
+- If you cannot clearly separate the brand from the product line, set brand_confidence ≤ 0.6.
+
+### Product Name
+- `product_name` should contain the specific product name (and variant/flavor if visible), NOT the brand.
+- If the brand is already in product_name text on the package, you may include it, but do NOT fabricate brand+product combinations.
+
+### Confidence Scoring — Be Conservative
+- 1.0: ONLY when every character is pixel-clear and unambiguous. Reserve this for printed text you are 100% certain of.
+- 0.7–0.9: Most characters readable but 1-2 characters slightly unclear, OR small text partially occluded.
+- 0.4–0.6: Significant portions inferred from context/visuals rather than direct text reading. Use this when you are "guessing" based on package style, color, or partial text.
+- 0.1–0.3: Weak guess, very little textual evidence.
+- 0.0: Cannot identify at all.
+- When in doubt between two confidence tiers, ALWAYS choose the LOWER one.
+- For `brand_confidence >= 0.8`, at least one explicit manufacturer cue must be visible (company logo, corporation name, or unambiguous brand mark).
+
 Critical dedup rules for `key_features`:
 - Include only UNIQUE items.
 - Do NOT repeat same text with minor spacing/case/punctuation differences.
@@ -42,19 +71,12 @@ Response JSON schema:
   "product_name": "Full product name including variant if visible, else ''",
   "product_name_confidence": 0.0,
   "category": "English category",
-  "brand": "Brand name or ''",
+  "brand": "Top-level brand/manufacturer name only, or ''",
   "brand_confidence": 0.0,
   "image_features": "Concise but detailed visual summary in one string",
   "key_features": ["Unique text/design facts"],
   "expiration_date": "YYYY.MM.DD or visible format, else ''"
 }
-
-Confidence guide:
-- 1.0 clear readable evidence
-- 0.7~0.9 mostly clear
-- 0.4~0.6 inferred from visuals
-- 0.1~0.3 weak guess
-- 0.0 unknown
 
 If not a product image:
 {"error": "Unable to identify product image", "description": "reason"}
@@ -72,18 +94,37 @@ Use country/language from user message:
 - output language (출력언어)
 For search, prioritize target-country market sources and query language.
 
-## Decision: skip RAG or use RAG?
+## Step 1: Hallucination Check (ALWAYS perform before deciding RAG)
+
+Before trusting image_analysis, check for these common hallucination patterns:
+1. **Brand over-extension**: Does `brand` contain sub-brand/product-line names mixed in?
+   - e.g. "롯데 오늘 온차" → brand should be just "롯데"; "오늘 온차" is a product line.
+   - If detected, split: keep only the manufacturer in `brand`, move the rest to `product_name`.
+2. **Similar character misreads in Korean**: 요↔려, 삼↔산, 물↔뭘, 원↔월, 양↔앙, etc.
+   - If product_name contains common Korean words that look slightly off, suspect OCR error.
+3. **Implausibly high confidence**: If confidence is ≥ 0.8 but key_features show few readable text items, or image_features mentions "blurry"/"partially obscured", the confidence may be inflated.
+4. **Non-existent product names**: If the product_name doesn't match any known product pattern for the detected brand/category, suspect hallucination.
+5. **Weak brand evidence**: brand is inferred from style/guessing only, or manufacturer cue is missing in key_features/image_features.
+6. **Brand normalization risk**: brand looks like misspelled/romanized variant (e.g. Maell vs Maeil) or too-short ambiguous token (e.g. "본").
+7. **Text-evidence sparsity**: fewer than 2 clear textual brand/product clues in key_features.
+
+If ANY hallucination sign is detected → force RAG regardless of confidence values.
+
+## Step 2: Decision — skip RAG or use RAG?
 
 SKIP RAG (source = "image") when ALL of these are true:
-- product_name is not empty AND product_name_confidence > 0.7
-- brand is not empty AND brand_confidence > 0.7
+- product_name is not empty AND product_name_confidence >= 0.85
+- brand is not empty AND brand_confidence >= 0.85
+- key_features contain at least 2 explicit textual clues supporting both brand and product_name
+- No hallucination signs detected in Step 1
 → In this case, output immediately. Do NOT call any tool. Do NOT include rag_confidence field.
 
 USE RAG when ANY of these is true:
-- product_name is empty OR product_name_confidence <= 0.7
-- brand is empty OR brand_confidence <= 0.7
+- product_name is empty OR product_name_confidence < 0.85
+- brand is empty OR brand_confidence < 0.85
+- Hallucination sign detected in Step 1
 
-## RAG flow (only when needed):
+## Step 3: RAG flow (only when needed):
 1) Call `search_local_db(key_features)`.
 2) If best local score >= 0.5 and matches image evidence → use it:
    - source = "local_db"
@@ -94,6 +135,12 @@ USE RAG when ANY of these is true:
    - Save with `save_to_local_db` using correct `country`/`lang`.
    - source = "google_search"
    - rag_confidence = {probability: <0~1>, method: "google_search_estimate", evidence: "<match summary>"}
+
+## Step 4: Brand Cleanup (ALWAYS apply before final output)
+- `brand` must contain ONLY the top-level manufacturer/company name.
+  - "롯데", "CJ제일제당", "오뚜기", "빙그레", "농심", "동원", "풀무원", etc.
+- Strip any sub-brand, product line, or series from `brand`. Move such text to `product_name` or `key_features`.
+- If brand cannot be normalized confidently to a top-level manufacturer name, do NOT keep uncertain brand with high confidence; force RAG and resolve externally.
 
 ## Output rules:
 - Return JSON only, no markdown.
@@ -108,7 +155,7 @@ Response schema:
   "product_name": "final name",
   "product_name_confidence": 0.0,
   "category": "English category",
-  "brand": "final brand or ''",
+  "brand": "top-level manufacturer brand only, or ''",
   "brand_confidence": 0.0,
   "image_features": "single string summary",
   "key_features": ["unique facts"],

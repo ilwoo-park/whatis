@@ -89,7 +89,7 @@ Output  : JSON → saved to session state["image_analysis"] via output_key
   "product_name": "Full product name including variant if visible, else ''",
   "product_name_confidence": 0.0,
   "category": "English category (always in English)",
-  "brand": "Brand name or ''",
+  "brand": "Top-level manufacturer/company brand name only (no sub-brands/line names)",
   "brand_confidence": 0.0,
   "image_features": "Visual summary — single string (never object/array)",
   "key_features": ["Unique text/design facts (deduped, 8~20 items)"],
@@ -99,6 +99,13 @@ Output  : JSON → saved to session state["image_analysis"] via output_key
 
 > For non-product images: `{"error": "Unable to identify product image", "description": "reason"}`
 
+**Anti-Hallucination Rules:**
+- **Text Reading**: Report package text exactly character-by-character. If a character is unclear, set confidence ≤ 0.6 instead of guessing.
+- **Similar Character Caution (Korean)**: Characters like 요↔려, 삼↔산, 물↔뭘 are frequent OCR misread sources. When uncertain, choose lower confidence.
+- **`brand` field**: Must contain ONLY the top-level manufacturer/company name (e.g. "롯데", "CJ제일제당", "오뚜기"). Move sub-brands/line names to `product_name` or `key_features`.
+  - ✗ "롯데 오늘 온차" → ✓ brand="롯데", include "오늘 온차" in product_name
+- **Conservative confidence**: When in doubt between two tiers, ALWAYS choose the lower one. 1.0 is reserved for 100% pixel-clear text only.
+
 **`key_features` Dedup Rules:**
 - Merge near-duplicates into one normalized item; one concept per item
 - Minimum 8 items, maximum 20 items
@@ -107,9 +114,9 @@ Output  : JSON → saved to session state["image_analysis"] via output_key
 **Confidence Guide:**
 | Value | Meaning |
 |-------|---------|
-| 1.0 | Text/logo clearly readable in image |
-| 0.7–0.9 | Partially obscured or blurry but high confidence |
-| 0.4–0.6 | Inferred from packaging style/colors/visual context |
+| 1.0 | Every character is 100% clear and unambiguous (strictly applied) |
+| 0.7–0.9 | Most characters readable but 1-2 slightly unclear |
+| 0.4–0.6 | Significant portions inferred from visual context. Use when "guessing" |
 | 0.1–0.3 | Weak guess based on general appearance |
 | 0.0 | Cannot identify |
 
@@ -128,8 +135,11 @@ Output  : final JSON (includes source + rag_confidence)
 
 ```mermaid
 flowchart TD
-    START(["Read image_analysis"]) --> CHECK{"product_name_confidence > 0.7\nAND brand_confidence > 0.7?"}
-    CHECK -->|YES| SRC_IMAGE["source = image\nrag_confidence omitted"]
+    START(["Read image_analysis"]) --> HALLU{"Hallucination Check\n(brand over-extension, similar char misreads,\ninflated confidence, non-existent product names)"}
+    HALLU -->|"Suspicion detected"| SDB
+    HALLU -->|"No suspicion"| CHECK{"product_name_confidence > 0.7\nAND brand_confidence > 0.7?"}
+    CHECK -->|YES| BRAND_CLEAN["Brand cleanup\n(strip sub-brands)"]
+    BRAND_CLEAN --> SRC_IMAGE["source = image\nrag_confidence omitted"]
     CHECK -->|NO| SDB["search_local_db(key_features)"]
     SDB --> FOUND{"Best score >= 0.5\nAND matches image evidence?"}
     FOUND -->|YES| SRC_LOCAL["source = local_db\nrag_confidence.probability = score\nmethod = local_db_score"]
@@ -137,6 +147,14 @@ flowchart TD
     GSEARCH --> SAVE["save_to_local_db()"]
     SAVE --> SRC_GOOGLE["source = google_search\nrag_confidence.probability = estimated\nmethod = google_search_estimate"]
 ```
+
+**Hallucination Detection Criteria (rag_agent Step 1):**
+| Pattern | Description | Action |
+|---------|-------------|--------|
+| Brand over-extension | `brand` contains sub-brand/line names (e.g. "Lotte Oneul Oncha") | Split & force RAG |
+| Similar character misread | Korean OCR-error-prone characters (요↔려, 삼↔산, etc.) | Force RAG |
+| Inflated confidence | High confidence but few readable text items in key_features | Force RAG |
+| Non-existent product name | Product name doesn't match known patterns for detected brand/category | Force RAG |
 
 **`source` Output Rules:**
 
