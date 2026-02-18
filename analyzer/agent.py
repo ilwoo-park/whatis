@@ -11,32 +11,52 @@ image_analyzer = Agent(
     description="상품 이미지를 분석하여 시각 정보를 추출하는 에이전트",
     output_key="image_analysis",
     instruction="""You are a product image analysis expert.
-When the user sends a product image, analyze it and extract all visible information.
+Analyze the product image precisely and return only one JSON object.
 
-Respond ONLY with a JSON object. Do NOT include any text outside the JSON. Do NOT use markdown code blocks (```).
+Context from user message:
+- country code: e.g. 국가코드=KR
+- output language: e.g. 출력언어=ko
+Use country context to prioritize local language/brands (KR/JP/US/CN etc).
 
-All string values in the JSON must be written in the user's requested language from the conversation context.
+Output rules:
+- No text outside JSON, no markdown.
+- All string fields except `category` must use user's output language.
+- `category` must always be in English.
+- `image_features` must be a single string (never object/array).
+- `key_features` must be an array of short strings only.
+
+What to extract:
+1) All readable package text (brand, product name, variant, certifications, weight/volume, dates)
+2) Visual evidence (dominant colors, package type/material, graphics/mascots, layout)
+3) Best determination of product_name and brand using text first, visual clues second
+
+Critical dedup rules for `key_features`:
+- Include only UNIQUE items.
+- Do NOT repeat same text with minor spacing/case/punctuation differences.
+- Merge near-duplicates into one normalized item.
+- One concept per item; no long paragraphs.
+- Keep concise: 8~20 items maximum.
 
 Response JSON schema:
 {
-  "product_name": "Product name or type identified from the image. Use empty string '' if not identifiable",
-  "product_name_confidence": "number between 0.0 and 1.0 indicating how confident you are about the product_name. 1.0 = text clearly visible, 0.0 = pure guess",
-  "category": "Product category in English (e.g. Electronics, Clothing, Food, Beverage, Furniture, etc.)",
-  "brand": "Brand name if identifiable. Use empty string '' if not identifiable",
-  "brand_confidence": "number between 0.0 and 1.0 indicating how confident you are about the brand. 1.0 = logo/text clearly visible, 0.0 = pure guess. Use 0.0 when brand is empty",
-  "image_features": "Summary of visual characteristics (shape, color, package design, etc.)",
-  "key_features": ["List of notable features including color, material, design, AND all recognized text/labels visible in the image"],
-  "expiration_date": "Expiration date or best-before date if visible in the image (e.g. '2025.12.31'). Use empty string '' if not visible"
+  "product_name": "Full product name including variant if visible, else ''",
+  "product_name_confidence": 0.0,
+  "category": "English category",
+  "brand": "Brand name or ''",
+  "brand_confidence": 0.0,
+  "image_features": "Concise but detailed visual summary in one string",
+  "key_features": ["Unique text/design facts"],
+  "expiration_date": "YYYY.MM.DD or visible format, else ''"
 }
 
-Confidence scoring guidelines:
-- 1.0: Text/logo is clearly readable in the image
-- 0.7-0.9: Partially visible or slightly blurred but highly likely
-- 0.4-0.6: Inferred from visual context (packaging style, shape, color) without clear text
-- 0.1-0.3: Low confidence guess based on general appearance
-- 0.0: Not identifiable or empty string value
+Confidence guide:
+- 1.0 clear readable evidence
+- 0.7~0.9 mostly clear
+- 0.4~0.6 inferred from visuals
+- 0.1~0.3 weak guess
+- 0.0 unknown
 
-If no product is found or the image is not a product:
+If not a product image:
 {"error": "Unable to identify product image", "description": "reason"}
 """,
 )
@@ -45,60 +65,70 @@ rag_agent = Agent(
     name="rag_agent",
     model="gemini-2.5-flash",
     description="이미지 분석 결과를 보완하고 최종 JSON을 출력하는 에이전트",
-    instruction="""You receive a product image analysis result from a previous step.
-The analysis is available in the session state as: {image_analysis}
+    instruction="""You receive image analysis from previous step in session state: {image_analysis}
 
-## Your task
-1. Read the image analysis result above.
-2. Determine if RAG search is needed. RAG is needed when ANY of these conditions is true:
-   - `product_name` is empty or not identified
-   - `brand` is empty or not identified
-   - `product_name_confidence` <= 0.7
-   - `brand_confidence` <= 0.7
-3. If RAG search IS needed:
-   a. Call `search_local_db` with the `key_features` from the analysis.
-   b. If local DB returns results (`found: true`), use the best matching result to fill in or correct `brand` and/or `product_name`. Set `source` to `local_db`.
-    - Also set `rag_confidence.probability` using the best result's `score` value directly.
-    - Set `rag_confidence.method` to `local_db_score`.
-    - Set `rag_confidence.evidence` to a short explanation of matched key features.
-   c. If local DB has no results (`found: false`), use `google_search` to search for the product using key features as the query.
-      - After finding information via Google Search, call `save_to_local_db` to save the product info for future use.
-    - When calling `save_to_local_db`, pass concrete `country` and `lang` values inferred from the user request. If not provided, use `country="KR"` and `lang="ko"`.
-      - Set `source` to `google_search`.
-    - Set `rag_confidence.probability` as your confidence estimate between 0 and 1 based on evidence consistency (brand match, product name match, packaging/text consistency).
-    - Set `rag_confidence.method` to `google_search_estimate`.
-    - Set `rag_confidence.evidence` to a short evidence summary.
-4. If RAG search is NOT needed (both product_name and brand are identified with confidence > 0.7), set `source` to `image`.
-  - In this case, do not include `rag_confidence`.
+Use country/language from user message:
+- country code (국가코드)
+- output language (출력언어)
+For search, prioritize target-country market sources and query language.
 
-## Response format
-Respond ONLY with a JSON object. Do NOT include any text outside the JSON. Do NOT use markdown code blocks (```).
+## Decision: skip RAG or use RAG?
 
-All string values in the JSON must be written in the user's requested language from the conversation context.
+SKIP RAG (source = "image") when ALL of these are true:
+- product_name is not empty AND product_name_confidence > 0.7
+- brand is not empty AND brand_confidence > 0.7
+→ In this case, output immediately. Do NOT call any tool. Do NOT include rag_confidence field.
 
-Response JSON schema:
+USE RAG when ANY of these is true:
+- product_name is empty OR product_name_confidence <= 0.7
+- brand is empty OR brand_confidence <= 0.7
+
+## RAG flow (only when needed):
+1) Call `search_local_db(key_features)`.
+2) If best local score >= 0.5 and matches image evidence → use it:
+   - source = "local_db"
+   - rag_confidence = {probability: <score>, method: "local_db_score", evidence: "<short match summary>"}
+3) Otherwise search web using strongest clues (readable text + category + visuals).
+   - Try refined queries if first result is unclear.
+   - Verify result matches image before accepting.
+   - Save with `save_to_local_db` using correct `country`/`lang`.
+   - source = "google_search"
+   - rag_confidence = {probability: <0~1>, method: "google_search_estimate", evidence: "<match summary>"}
+
+## Output rules:
+- Return JSON only, no markdown.
+- All string fields except `category` use user's output language.
+- `category` must always be in English.
+- `image_features` must be a single string (never object or array).
+- `key_features` must be UNIQUE concise items only (no paragraphs), 8~20 max.
+- CRITICAL: when source = "image", the `rag_confidence` field MUST NOT appear in the output at all.
+
+Response schema:
 {
-  "product_name": "Product name or type identified",
-  "product_name_confidence": "number between 0.0 and 1.0 (carry over from image_analysis, or update if RAG improved it)",
-  "category": "Product category in English (e.g. Electronics, Clothing, Food, Beverage, Furniture, etc.)",
-  "brand": "Brand name if identifiable. Use empty string '' if not identifiable",
-  "brand_confidence": "number between 0.0 and 1.0 (carry over from image_analysis, or update if RAG improved it)",
-  "image_features": "Summary of visual characteristics (shape, color, package design, etc.)",
-  "key_features": ["List of notable features"],
-  "expiration_date": "Expiration date if visible (e.g. '2025.12.31'). Use empty string '' if not visible",
-  "source": "image | local_db | google_search",
-  "rag_confidence": {
-    "probability": "number between 0 and 1 (include only when source is local_db or google_search)",
-    "method": "local_db_score | google_search_estimate",
-    "evidence": "short reason for the probability"
-  }
+  "product_name": "final name",
+  "product_name_confidence": 0.0,
+  "category": "English category",
+  "brand": "final brand or ''",
+  "brand_confidence": 0.0,
+  "image_features": "single string summary",
+  "key_features": ["unique facts"],
+  "expiration_date": "date or ''",
+  "source": "image | local_db | google_search"
 }
 
-Confidence update rules:
-- If source is "image": keep the original confidence values from image_analysis as-is.
-- If source is "local_db" or "google_search" and you updated product_name or brand: set the confidence to rag_confidence.probability.
+When source = "local_db" or "google_search", append this field:
+  "rag_confidence": {
+    "probability": 0.0,
+    "method": "local_db_score | google_search_estimate",
+    "evidence": "short evidence"
+  }
+When source = "image", omit rag_confidence entirely — do not output the key.
 
-If the analysis contains an error, pass it through as-is.
+Confidence rule:
+- source=image: carry over confidence values from image_analysis unchanged.
+- source=local_db/google_search with corrected brand/name: set confidence to rag_confidence.probability.
+
+If input contains error, pass it through.
 """,
     tools=[search_local_db, save_to_local_db, google_search_tool],
 )

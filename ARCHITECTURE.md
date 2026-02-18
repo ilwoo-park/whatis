@@ -45,7 +45,7 @@ flowchart TD
 | 역할 | 상세 |
 |------|------|
 | 인수 파싱 | `image/directory`, `sample_count`, `--country`, `--lang`, `--random` |
-| 이미지 로딩 | `load_image_as_part()`: 파일을 `bytes` 로 읽어 `types.Part(inline_data=Blob)` 생성 |
+| 이미지 로딩 | `load_image_as_part()`: `mimetypes.guess_type()`으로 MIME 자동 감지 후 파일을 `bytes`로 읽어 `types.Part(inline_data=Blob)` 생성 |
 | 해상도 출력 | Pillow `Image.open()`으로 WxH 확인 |
 | ADK 세션 | `InMemoryRunner` + `session_service.create_session()`, state에 `country/lang` 전달 |
 | 이벤트 스트림 | `runner.run_async()` 이벤트를 순회, `author` 변경 시 에이전트 호출 출력, `function_call` 도구 이름 출력 |
@@ -79,23 +79,30 @@ flowchart TD
 ```
 모델  : gemini-2.5-flash-lite   (저비용, 이미지 분석 특화)
 도구  : 없음
-입력  : 사용자 메시지 + 이미지 (inline bytes)
+입력  : 사용자 메시지 + 이미지 (inline bytes) — country/lang 컨텍스트 포함
 출력  : JSON → session state["image_analysis"] 에 저장 (output_key)
 ```
 
 **출력 스키마:**
 ```json
 {
-  "product_name": "상품명",
-  "product_name_confidence": 0.0 ~ 1.0,
-  "category": "영문 카테고리",
-  "brand": "브랜드명",
-  "brand_confidence": 0.0 ~ 1.0,
-  "image_features": "시각적 특징 요약",
-  "key_features": ["인식된 텍스트/특징 리스트"],
-  "expiration_date": "유통기한 또는 빈 문자열"
+  "product_name": "Full product name including variant if visible, else ''",
+  "product_name_confidence": 0.0,
+  "category": "English category (항상 영문)",
+  "brand": "Brand name or ''",
+  "brand_confidence": 0.0,
+  "image_features": "시각적 특징 요약 — 단일 문자열 (객체/배열 불가)",
+  "key_features": ["고유 텍스트/디자인 사실 (중복 제거, 8~20개)"],
+  "expiration_date": "YYYY.MM.DD 또는 빈 문자열"
 }
 ```
+
+> 비상품 이미지인 경우: `{"error": "Unable to identify product image", "description": "reason"}`
+
+**`key_features` dedup 규칙:**
+- 중복/유사 항목 통합, 개당 하나의 개념만 포함
+- 최소 8개 ~ 최대 20개
+- `category`는 항상 영문; 나머지 문자열 필드는 사용자 출력 언어 사용
 
 **신뢰도(confidence) 기준:**
 | 값 | 의미 |
@@ -112,7 +119,7 @@ flowchart TD
 
 ```
 모델  : gemini-2.5-flash   (function calling 지원)
-도구  : search_local_db, save_to_local_db, GoogleSearchTool
+도구  : search_local_db, save_to_local_db, GoogleSearchTool(bypass_multi_tools_limit=True)
 입력  : {image_analysis} — session state 템플릿 변수
 출력  : 최종 JSON (source + rag_confidence 포함)
 ```
@@ -124,20 +131,20 @@ flowchart TD
     START(["image_analysis 읽기"]) --> CHECK{"product_name_confidence > 0.7\nAND brand_confidence > 0.7?"}
     CHECK -->|YES| SRC_IMAGE["source = image\nrag_confidence 미포함"]
     CHECK -->|NO| SDB["search_local_db(key_features)"]
-    SDB --> FOUND{"found = true?"}
+    SDB --> FOUND{"최고 score >= 0.5\nAND 이미지 근거 일치?"}
     FOUND -->|YES| SRC_LOCAL["source = local_db\nrag_confidence.probability = score\nmethod = local_db_score"]
-    FOUND -->|NO| GSEARCH["GoogleSearchTool 호출"]
+    FOUND -->|NO| GSEARCH["GoogleSearchTool 호출\n(정제 쿼리 재시도 포함)"]
     GSEARCH --> SAVE["save_to_local_db()"]
     SAVE --> SRC_GOOGLE["source = google_search\nrag_confidence.probability = 추정값\nmethod = google_search_estimate"]
 ```
 
 **`source` 값별 출력 규칙:**
 
-| source | rag_confidence | 설명 |
-|--------|---------------|------|
-| `image` | 미포함 | 이미지에서 직접 식별 (high confidence) |
-| `local_db` | 포함 | Vector DB 코사인 유사도 score 직접 사용 |
-| `google_search` | 포함 | 근거 일치도 기반 0~1 추정값 |
+| source | rag_confidence | confidence 값 | 설명 |
+|--------|---------------|--------------|------|
+| `image` | 미포함 | image_analysis 값 그대로 이관 | 이미지에서 직접 식별 (high confidence) |
+| `local_db` | 포함 | `rag_confidence.probability` 값으로 덮어씀 | Vector DB 코사인 유사도 score 직접 사용 |
+| `google_search` | 포함 | `rag_confidence.probability` 값으로 덮어씀 | 근거 일치도 기반 0~1 추정값 |
 
 ---
 
@@ -146,6 +153,7 @@ flowchart TD
 ```python
 root_agent = SequentialAgent(
     name="product_analyzer",
+    description="상품 이미지를 분석하여 상품 정보를 알려주는 에이전트",
     sub_agents=[image_analyzer, rag_agent],
 )
 ```
@@ -194,12 +202,16 @@ Gemini API: gemini-embedding-001
 ```
 1. key_features 리스트를 공백으로 join → 쿼리 문자열
 2. Gemini로 768차원 임베딩 생성
-3. USearch index.search(query_vec, n=3) — Top-K 코사인 검색
+3. USearch index.search(query_vec, n=3) — Top-3 코사인 검색
 4. score = 1.0 - cosine_distance  (코사인 유사도)
-5. score < 0.3 인 결과 필터링
+5. score < 0.3 인 결과 필터링 (사전 제거)
 6. 매칭 있으면 {"found": true, "results": [...]} 반환
    매칭 없으면 {"found": false, "message": "..."} 반환
 ```
+
+> **결과 항목 필드**: `product_name`, `brand`, `category`, `key_features`, `score`
+
+> **rag_agent의 최종 채택 기준**: `score >= 0.5` AND 이미지 근거 일치 시 사용, 미달 시 Google Search 진행
 
 ---
 
@@ -218,7 +230,11 @@ Gemini API: gemini-embedding-001
 
 #### 마이그레이션 (`_migrate_json_db`)
 
-최초 실행 시 `datasets/products_db.json`이 존재하면 자동으로 Vector DB로 이전합니다. 이후 실행에서는 `products_meta.json`에 데이터가 있으면 건너뜁니다.
+`_get_index()` 초기화 시 인덱스 로딩 조건:
+- `products.usearch` 존재 **AND** `products_meta.json`에 products 데이터 있으면 → 디스크에서 로드
+- products가 비어 있으면 → `datasets/products_db.json`이 존재할 경우 자동 마이그레이션 실행
+
+이후 실행에서는 `products_meta.json`에 데이터가 있으면 마이그레이션을 건너뜁니다.
 
 ---
 
@@ -243,14 +259,14 @@ sequenceDiagram
     IA->>ADK: JSON → session state["image_analysis"]
     ADK->>RA: {image_analysis} 전달
 
-    alt confidence ≤ 0.7
+    alt confidence <= 0.7 (또는 상품명/브랜드 불명확)
         RA->>Tools: search_local_db(key_features)
         Tools->>VDB: 임베딩 생성 + 코사인 검색
-        VDB-->>Tools: Top-K 결과
+        VDB-->>Tools: Top-3 결과 (score, category, key_features 포함)
         Tools-->>RA: {found, results}
 
-        alt found = false
-            RA->>GS: Google Search (key_features)
+        alt score < 0.5 또는 근거 불일치
+            RA->>GS: Google Search (정제 쿼리, 재시도 포함)
             GS-->>RA: 검색 결과
             RA->>Tools: save_to_local_db(...)
             Tools->>VDB: 임베딩 생성 + 저장 (영속화)
@@ -339,6 +355,8 @@ graph TD
 | `MAX_RETRIES` | `2` (3회 시도) | `tools.py`, `main.py` |
 | `RETRY_DELAY` | `3`초 | `tools.py`, `main.py` |
 | Vector DB 경로 | `datasets/vectordb/` | `tools.py` 상수 |
+| `IMAGE_EXTENSIONS` | `.jpg .jpeg .png .gif .webp .bmp .tiff` | `main.py` 상수 |
+| local_db 채택 임계값 | `score >= 0.5` (사전 필터: `< 0.3` 제거) | `rag_agent` 프롬프트 |
 
 ---
 
@@ -355,7 +373,7 @@ graph TD
 ### 7.3 Vector DB (USearch + Gemini Embedding)
 - 기존 키워드 집합 교집합 방식 → 의미 기반 검색(semantic search)으로 전환
 - 코사인 유사도 기반이므로 "초콜릿" → "초코파이" 같은 의미 유사 매칭 가능
-- score < 0.3 필터링으로 무관한 결과 차단
+- score < 0.3 사전 필터링으로 무관한 결과 차단, rag_agent는 score >= 0.5 기준으로 최종 채택 결정
 
 ### 7.4 Google Search → 자동 DB 저장 (RAG 누적)
 - Google Search로 찾은 상품 정보를 `save_to_local_db()`로 즉시 저장
