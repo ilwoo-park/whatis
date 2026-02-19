@@ -12,6 +12,7 @@ from usearch.index import Index
 VECTORDB_DIR = Path(__file__).resolve().parent.parent / "datasets" / "vectordb"
 INDEX_PATH = VECTORDB_DIR / "products.usearch"
 META_PATH = VECTORDB_DIR / "products_meta.json"
+SAVE_LOG_PATH = VECTORDB_DIR / "save_events.jsonl"
 JSON_DB_PATH = Path(__file__).resolve().parent.parent / "datasets" / "products_db.json"
 
 EMBEDDING_MODEL = "gemini-embedding-001"
@@ -58,6 +59,42 @@ def _save_meta(meta: dict) -> None:
     """메타데이터 JSON을 저장합니다."""
     META_PATH.parent.mkdir(parents=True, exist_ok=True)
     META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalize_text(value: str) -> str:
+    """문자열 정규화: 앞뒤 공백 제거 및 내부 다중 공백 축소."""
+    if not value:
+        return ""
+    return " ".join(value.split()).strip()
+
+
+def _normalize_features(key_features: list[str]) -> list[str]:
+    """key_features 정규화 및 중복 제거(순서 유지)."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in key_features or []:
+        token = _normalize_text(item)
+        if not token:
+            continue
+        dedup_key = token.casefold()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        normalized.append(token)
+
+    return normalized
+
+
+def _append_save_log(event: dict) -> None:
+    """저장 시도 로그(JSONL)를 누적 기록합니다."""
+    VECTORDB_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        **event,
+    }
+    with SAVE_LOG_PATH.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 # --- USearch 인덱스 관리 (싱글턴) ---
@@ -156,10 +193,12 @@ def search_local_db(key_features: list[str]) -> str:
     """
     index, meta = _get_index()
 
-    if len(index) == 0 or not key_features:
+    normalized_features = _normalize_features(key_features)
+
+    if len(index) == 0 or not normalized_features:
         return json.dumps({"found": False, "message": "로컬 DB에 상품이 없습니다."}, ensure_ascii=False)
 
-    query_text = " ".join(key_features)
+    query_text = " ".join(normalized_features)
     query_vec = np.array(_get_embedding([query_text])[0], dtype=np.float32)
 
     n_results = min(3, len(index))
@@ -216,38 +255,206 @@ def save_to_local_db(
     Returns:
         저장 결과 메시지
     """
+    normalized_product_name = _normalize_text(product_name)
+    normalized_brand = _normalize_text(brand)
+    normalized_category = _normalize_text(category)
+    normalized_source = _normalize_text(source)
+    normalized_country = _normalize_text(country) or "KR"
+    normalized_lang = _normalize_text(lang) or "ko"
+    normalized_features = _normalize_features(key_features)
+
+    if normalized_source.casefold() == "image":
+        _append_save_log(
+            {
+                "status": "skipped",
+                "reason": "source_image_not_allowed",
+                "product_name": normalized_product_name,
+                "brand": normalized_brand,
+                "source": normalized_source,
+                "country": normalized_country,
+                "lang": normalized_lang,
+            }
+        )
+        return json.dumps(
+            {
+                "saved": False,
+                "reason": "source_image_not_allowed",
+                "message": "source=image 결과는 로컬 DB에 저장하지 않습니다.",
+            },
+            ensure_ascii=False,
+        )
+
+    if normalized_source.casefold() == "local_db":
+        _append_save_log(
+            {
+                "status": "skipped",
+                "reason": "source_local_db_not_allowed",
+                "product_name": normalized_product_name,
+                "brand": normalized_brand,
+                "source": normalized_source,
+                "country": normalized_country,
+                "lang": normalized_lang,
+            }
+        )
+        return json.dumps(
+            {
+                "saved": False,
+                "reason": "source_local_db_not_allowed",
+                "message": "source=local_db 결과는 로컬 DB에 저장하지 않습니다.",
+            },
+            ensure_ascii=False,
+        )
+
+    missing_fields = []
+    if not normalized_product_name:
+        missing_fields.append("product_name")
+    if not normalized_brand:
+        missing_fields.append("brand")
+    if not normalized_category:
+        missing_fields.append("category")
+    if not normalized_features:
+        missing_fields.append("key_features")
+
+    if missing_fields:
+        _append_save_log(
+            {
+                "status": "skipped",
+                "reason": "missing_required_fields",
+                "missing_fields": missing_fields,
+                "product_name": normalized_product_name,
+                "brand": normalized_brand,
+                "source": normalized_source,
+                "country": normalized_country,
+                "lang": normalized_lang,
+            }
+        )
+        return json.dumps(
+            {
+                "saved": False,
+                "reason": "missing_required_fields",
+                "missing_fields": missing_fields,
+                "message": "필수 필드가 비어 있어 저장을 건너뜁니다.",
+            },
+            ensure_ascii=False,
+        )
+
     index, meta = _get_index()
 
-    # 중복 체크: 동일 상품명+브랜드가 있는지 확인
+    # 중복 체크: 동일 상품명+브랜드+국가+언어가 있는지 확인 (정규화 비교)
     for entry in meta["products"].values():
-        if entry["product_name"] == product_name and entry["brand"] == brand:
+        same_product = _normalize_text(entry.get("product_name", "")).casefold() == normalized_product_name.casefold()
+        same_brand = _normalize_text(entry.get("brand", "")).casefold() == normalized_brand.casefold()
+        same_country = _normalize_text(entry.get("country", "")).casefold() == normalized_country.casefold()
+        same_lang = _normalize_text(entry.get("lang", "")).casefold() == normalized_lang.casefold()
+
+        if not (same_product and same_brand and same_country and same_lang):
+            continue
+
+        existing_features = _normalize_features(entry.get("key_features", []))
+        merged_features = _normalize_features(existing_features + normalized_features)
+
+        if len(merged_features) > len(existing_features):
+            entry["key_features"] = merged_features
+            if not _normalize_text(entry.get("source", "")):
+                entry["source"] = normalized_source
+            _persist()
+            _append_save_log(
+                {
+                    "status": "updated",
+                    "reason": "duplicate_enriched",
+                    "product_name": normalized_product_name,
+                    "brand": normalized_brand,
+                    "source": normalized_source,
+                    "country": normalized_country,
+                    "lang": normalized_lang,
+                    "added_features": len(merged_features) - len(existing_features),
+                }
+            )
             return json.dumps(
-                {"saved": False, "message": "이미 동일한 상품이 DB에 존재합니다."},
+                {
+                    "saved": True,
+                    "updated": True,
+                    "message": "기존 상품을 찾아 key_features를 보강했습니다.",
+                },
                 ensure_ascii=False,
             )
 
-    doc_text = " ".join(key_features)
-    vec = np.array(_get_embedding([doc_text])[0], dtype=np.float32)
+        _append_save_log(
+            {
+                "status": "skipped",
+                "reason": "duplicate",
+                "product_name": normalized_product_name,
+                "brand": normalized_brand,
+                "source": normalized_source,
+                "country": normalized_country,
+                "lang": normalized_lang,
+            }
+        )
+        return json.dumps(
+            {
+                "saved": False,
+                "reason": "duplicate",
+                "message": "이미 동일한 상품이 DB에 존재합니다.",
+            },
+            ensure_ascii=False,
+        )
 
-    key = meta["next_key"]
-    meta["next_key"] = key + 1
-    index.add(key, vec)
+    try:
+        doc_text = " ".join(normalized_features)
+        vec = np.array(_get_embedding([doc_text])[0], dtype=np.float32)
 
-    meta["products"][str(key)] = {
-        "id": str(uuid.uuid4()),
-        "product_name": product_name,
-        "brand": brand,
-        "category": category,
-        "key_features": key_features,
-        "source": source,
-        "country": country,
-        "lang": lang,
-        "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-    }
+        key = meta["next_key"]
+        meta["next_key"] = key + 1
+        index.add(key, vec)
 
-    _persist()
+        meta["products"][str(key)] = {
+            "id": str(uuid.uuid4()),
+            "product_name": normalized_product_name,
+            "brand": normalized_brand,
+            "category": normalized_category,
+            "key_features": normalized_features,
+            "source": normalized_source,
+            "country": normalized_country,
+            "lang": normalized_lang,
+            "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
 
-    return json.dumps(
-        {"saved": True, "message": f"'{product_name}' 상품이 DB에 저장되었습니다."},
-        ensure_ascii=False,
-    )
+        _persist()
+        _append_save_log(
+            {
+                "status": "saved",
+                "reason": "ok",
+                "product_name": normalized_product_name,
+                "brand": normalized_brand,
+                "source": normalized_source,
+                "country": normalized_country,
+                "lang": normalized_lang,
+                "feature_count": len(normalized_features),
+            }
+        )
+
+        return json.dumps(
+            {"saved": True, "message": f"'{normalized_product_name}' 상품이 DB에 저장되었습니다."},
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        _append_save_log(
+            {
+                "status": "failed",
+                "reason": "exception",
+                "error": str(e),
+                "product_name": normalized_product_name,
+                "brand": normalized_brand,
+                "source": normalized_source,
+                "country": normalized_country,
+                "lang": normalized_lang,
+            }
+        )
+        return json.dumps(
+            {
+                "saved": False,
+                "reason": "exception",
+                "message": f"저장 중 오류가 발생했습니다: {e}",
+            },
+            ensure_ascii=False,
+        )

@@ -115,9 +115,10 @@ If ANY hallucination sign is detected → force RAG regardless of confidence val
 SKIP RAG (source = "image") when ALL of these are true:
 - product_name is not empty AND product_name_confidence >= 0.85
 - brand is not empty AND brand_confidence >= 0.85
-- key_features contain at least 2 explicit textual clues supporting both brand and product_name
+- key_features contain at least 3 explicit textual clues supporting both brand and product_name
+- key_features has at least 4 items total
 - No hallucination signs detected in Step 1
-→ In this case, output immediately. Do NOT call any tool. Do NOT include rag_confidence field.
+→ In this case, skip retrieval/search tools (`search_local_db`, `google_search_tool`) and keep source="image". Do NOT include rag_confidence field.
 
 USE RAG when ANY of these is true:
 - product_name is empty OR product_name_confidence < 0.85
@@ -126,21 +127,42 @@ USE RAG when ANY of these is true:
 
 ## Step 3: RAG flow (only when needed):
 1) Call `search_local_db(key_features)`.
-2) If best local score >= 0.5 and matches image evidence → use it:
-   - source = "local_db"
-   - rag_confidence = {probability: <score>, method: "local_db_score", evidence: "<short match summary>"}
-3) Otherwise search web using strongest clues (readable text + category + visuals).
-   - Try refined queries if first result is unclear.
-   - Verify result matches image before accepting.
-   - Save with `save_to_local_db` using correct `country`/`lang`.
-   - source = "google_search"
-   - rag_confidence = {probability: <0~1>, method: "google_search_estimate", evidence: "<match summary>"}
+2) Use local_db result ONLY when all are true:
+  - best local score >= 0.65
+  - at least 2 exact text clues from image/key_features overlap with the local_db candidate
+  - brand and category are not contradictory to image evidence
+  - otherwise, treat local_db as uncertain and continue to web search
+3) If local_db is accepted:
+  - source = "local_db"
+  - rag_confidence = {probability: <score>, method: "local_db_score", evidence: "<short match summary>"}
+  - Do NOT call `save_to_local_db`.
+4) Otherwise search web using strongest clues (readable text + category + visuals), verify the match, then:
+  - source = "google_search"
+  - rag_confidence = {probability: <0~1>, method: "google_search_estimate", evidence: "<match summary>"}
 
 ## Step 4: Brand Cleanup (ALWAYS apply before final output)
 - `brand` must contain ONLY the top-level manufacturer/company name.
   - "롯데", "CJ제일제당", "오뚜기", "빙그레", "농심", "동원", "풀무원", etc.
 - Strip any sub-brand, product line, or series from `brand`. Move such text to `product_name` or `key_features`.
 - If brand cannot be normalized confidently to a top-level manufacturer name, do NOT keep uncertain brand with high confidence; force RAG and resolve externally.
+
+## Step 5: Persistence rule (single rule)
+- Call `save_to_local_db` only when source = `google_search`.
+- Never call it when source = `image` or `local_db`.
+- Use finalized fields (product_name, brand, category, key_features, source, country, lang).
+- If save is duplicate/already exists, continue output normally.
+
+## Step 6: Tool usage matrix (strict)
+- source = image: no tools
+- source = local_db: `search_local_db` only
+- source = google_search: `search_local_db` + `google_search_tool`, then `save_to_local_db`
+
+## Step 7: Final self-check before output (MANDATORY)
+- `product_name` and `brand` must be supported by at least 2 textual clues from image or retrieved evidence.
+- If evidence is weak/contradictory, lower confidence and prefer google_search over local_db.
+- `brand_confidence` must be <= `product_name_confidence` when brand cue is weaker than product cue.
+- source=image: omit `rag_confidence`.
+- source=local_db/google_search: include `rag_confidence` and keep confidence values consistent with it.
 
 ## Output rules:
 - Return JSON only, no markdown.

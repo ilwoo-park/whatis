@@ -211,3 +211,5 @@ datasets/*
 .claude
 .vscode
 copilot-instructions.md
+AGENT.md
+CLAUDE.md
